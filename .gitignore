@@ -1,6 +1,9 @@
 # Environment
 .env
+.env.*
+!.env.example
 venv/
+.venv/
 
 # Python
 __pycache__/
@@ -21,6 +24,11 @@ data/_kaggle_tmp/
 # OS
 .DS_Store
 Thumbs.db
+
+# Frontend artifacts (all apps)
+**/node_modules/
+**/dist/
+**/.vite/
 
 # W&B
 wandb/

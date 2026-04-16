@@ -12,11 +12,10 @@ GET  /classes   List all supported disease class names.
 from __future__ import annotations
 
 import asyncio
-import io
+import base64
 import json
 import logging
 import os
-import tempfile
 import time
 import traceback
 import uuid
@@ -28,20 +27,33 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from api.auth import require_admin_user
+from api.db.alerts import auto_detect_outbreaks, create_alert, list_alerts
+from api.db.scans import get_user_scans, save_scan, update_scan_feedback
+from api.model_registry import (
+    activate_model,
+    get_active_model_entry,
+    list_models as list_registered_models,
+    register_model,
+)
 from api.schemas import (
+    AdminAlertCreateRequest,
+    AdminModelActivateRequest,
     ClassConfidence,
     EndpointMetrics,
     ErrorResponse,
+    ExplainPersistedResponse,
     ExplainResponse,
     HealthResponse,
     MetricsResponse,
     PredictionRequest,
     PredictionResponse,
     RootResponse,
+    ScanFeedbackRequest,
 )
 from api.utils import (
     ALLOWED_MIME_TYPES,
@@ -61,7 +73,20 @@ load_dotenv()
 # ── Configuration ───────────────────────────────────────────────────────────
 
 MODEL_PATH = os.getenv("MODEL_PATH", "src/weights/best_model.pth")
-DEVICE = os.getenv("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
+_requested_device = os.getenv("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
+_raw_cors_origins = os.getenv(
+    "CORS_ALLOW_ORIGINS",
+    "http://localhost:5173,http://localhost:5174,http://localhost:5175",
+)
+CORS_ALLOW_ORIGINS = [origin.strip() for origin in _raw_cors_origins.split(",") if origin.strip()]
+if _requested_device.startswith("cuda") and not torch.cuda.is_available():
+    DEVICE = "cpu"
+    logging.getLogger("aglen.api").warning(
+        "DEVICE was set to '%s' but CUDA is unavailable. Falling back to CPU.",
+        _requested_device,
+    )
+else:
+    DEVICE = _requested_device
 NUM_CLASSES = 38
 MAX_FILE_MB = MAX_FILE_BYTES / (1024 * 1024)
 
@@ -83,6 +108,18 @@ TAGS = [
         "name": "Meta",
         "description": "Health checks and model metadata.",
     },
+    {
+        "name": "Scans",
+        "description": "Persisted scan history and feedback.",
+    },
+    {
+        "name": "Alerts",
+        "description": "Disease alerts by state/district.",
+    },
+    {
+        "name": "Admin",
+        "description": "Administrative alert management endpoints.",
+    },
 ]
 
 
@@ -96,6 +133,7 @@ async def lifespan(app: FastAPI):
     app.state.model = None
     app.state.engine = None
     app.state.class_names = []
+    app.state.active_model = None
     app.state.device = DEVICE
     app.state.transform = get_transforms("val")
     app.state.metrics = {
@@ -115,49 +153,10 @@ async def lifespan(app: FastAPI):
         },
     }
 
-    # Class names — try to load from weights/class_names.json (from Colab), then dataset, then generic
-    class_names_path = Path("src/weights/class_names.json")
-    if class_names_path.is_file():
-        try:
-            with open(class_names_path) as f:
-                app.state.class_names = json.load(f)
-            num_classes = len(app.state.class_names)
-            print(f"✓ Loaded {num_classes} class names from {class_names_path}")
-        except Exception as exc:
-            print(f"⚠  Failed to load class_names.json: {exc}")
-            app.state.class_names = [f"class_{i}" for i in range(NUM_CLASSES)]
-            num_classes = NUM_CLASSES
-    else:
-        # Try loading from dataset
-        try:
-            train_ds = PlantDiseaseDataset("data/plantvillage", split="train")
-            app.state.class_names = train_ds.class_names
-            num_classes = train_ds.num_classes
-            print(f"✓ Loaded {num_classes} class names from training dataset")
-        except FileNotFoundError:
-            app.state.class_names = [f"class_{i}" for i in range(NUM_CLASSES)]
-            num_classes = NUM_CLASSES
-            print("⚠  No class names found — using generic class names.")
-
-    # Model
-    ckpt = Path(MODEL_PATH)
+    ckpt, class_names_path, model_meta = _resolve_startup_model()
     if ckpt.is_file():
         try:
-            model = build_model(num_classes=num_classes, freeze_backbone=False)
-            state_dict = torch.load(
-                str(ckpt), map_location=torch.device(DEVICE), weights_only=True
-            )
-            model.load_state_dict(state_dict)
-            model.to(DEVICE)
-            model.eval()
-            app.state.model = model
-
-            # Grad-CAM engine
-            app.state.engine = GradCAMEngine(
-                model=model,
-                device=DEVICE,
-                class_names=app.state.class_names,
-            )
+            _load_runtime_model(app.state, ckpt, class_names_path, model_meta)
             print(f"✓ Model loaded from {ckpt} on {DEVICE}")
         except Exception as exc:
             print(f"✗ Failed to load model: {exc}")
@@ -169,6 +168,7 @@ async def lifespan(app: FastAPI):
     # ── Shutdown ────────────────────────────────────────────────────────
     app.state.model = None
     app.state.engine = None
+    app.state.active_model = None
     print("Model resources released.")
 
 
@@ -189,7 +189,7 @@ app = FastAPI(
 # CORS — wide open for the demo frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ALLOW_ORIGINS or ["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -268,6 +268,83 @@ def _format_metric(metric: dict) -> EndpointMetrics:
         max_ms=round(metric["max_ms"], 3),
         last_ms=round(metric["last_ms"], 3),
     )
+
+
+def _load_class_names(class_names_path: Path | None) -> tuple[list[str], int, str]:
+    if class_names_path and class_names_path.is_file():
+        try:
+            class_names = json.loads(class_names_path.read_text(encoding="utf-8"))
+            if isinstance(class_names, list) and class_names:
+                return class_names, len(class_names), str(class_names_path)
+        except Exception:
+            pass
+
+    default_path = Path("src/weights/class_names.json")
+    if default_path.is_file():
+        try:
+            class_names = json.loads(default_path.read_text(encoding="utf-8"))
+            if isinstance(class_names, list) and class_names:
+                return class_names, len(class_names), str(default_path)
+        except Exception:
+            pass
+
+    try:
+        train_ds = PlantDiseaseDataset("data/plantvillage", split="train")
+        return train_ds.class_names, train_ds.num_classes, "dataset"
+    except FileNotFoundError:
+        class_names = [f"class_{i}" for i in range(NUM_CLASSES)]
+        return class_names, NUM_CLASSES, "generated"
+
+
+def _load_runtime_model(
+    app_state,
+    model_path: Path,
+    class_names_path: Path | None = None,
+    model_meta: dict | None = None,
+) -> None:
+    class_names, num_classes, source = _load_class_names(class_names_path)
+
+    model = build_model(num_classes=num_classes, freeze_backbone=False)
+    try:
+        state_dict = torch.load(
+            str(model_path), map_location=torch.device(DEVICE), weights_only=True
+        )
+    except TypeError:
+        state_dict = torch.load(str(model_path), map_location=torch.device(DEVICE))
+
+    model.load_state_dict(state_dict)
+    model.to(DEVICE)
+    model.eval()
+
+    app_state.model = model
+    app_state.class_names = class_names
+    app_state.engine = GradCAMEngine(
+        model=model,
+        device=DEVICE,
+        class_names=class_names,
+    )
+    app_state.active_model = {
+        "model_path": str(model_path),
+        "class_names_source": source,
+        "model_id": model_meta.get("model_id") if model_meta else None,
+        "label": model_meta.get("label") if model_meta else Path(model_path).name,
+        "loaded_at": time.time(),
+    }
+
+
+def _resolve_startup_model() -> tuple[Path, Path | None, dict | None]:
+    active_entry = get_active_model_entry()
+    if active_entry:
+        model_path = Path(active_entry.get("model_path", ""))
+        class_names_path = (
+            Path(active_entry["class_names_path"])
+            if active_entry.get("class_names_path")
+            else None
+        )
+        if model_path.is_file():
+            return model_path, class_names_path, active_entry
+
+    return Path(MODEL_PATH), None, None
 
 
 @app.middleware("http")
@@ -394,6 +471,12 @@ async def root():
             "/predict/base64",
             "/explain",
             "/explain/base64",
+            "/scans",
+            "/alerts",
+            "/admin/alerts",
+            "/admin/models",
+            "/admin/models/upload",
+            "/admin/models/activate",
         ],
     )
 
@@ -518,7 +601,7 @@ async def predict_base64(body: PredictionRequest):
 
 @app.post(
     "/explain",
-    response_model=ExplainResponse,
+    response_model=ExplainPersistedResponse,
     responses={
         422: {"model": ErrorResponse, "description": "Invalid image format."},
         503: {"model": ErrorResponse, "description": "Model not loaded."},
@@ -531,12 +614,22 @@ async def predict_base64(body: PredictionRequest):
 )
 async def explain(
     file: UploadFile = File(...),
+    x_user_id: str | None = Header(default=None, alias="X-User-Id"),
 ):
     _require_model(app.state)
 
     start = time.perf_counter()
     try:
-        image_rgb = await _read_upload(file)
+        if not file.filename:
+            raise ValueError("No file was uploaded. Choose an image and try again.")
+
+        validate_content_type(file.content_type)
+        image_bytes = await file.read()
+        if not image_bytes:
+            raise ValueError("Uploaded file is empty. Please upload a valid image file.")
+
+        validate_file_size(image_bytes)
+        image_rgb = bytes_to_rgb_array(image_bytes)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=f"{exc} {_upload_validation_hint()}")
 
@@ -552,8 +645,240 @@ async def explain(
             app.state.device,
         ),
     )
+
+    persisted_scan_id: str | None = None
+    if x_user_id:
+        try:
+            heatmap_bytes = base64.b64decode(response.heatmap_base64)
+            saved = await save_scan(
+                user_id=x_user_id,
+                scan_data=response.model_dump(),
+                image_bytes=image_bytes,
+                heatmap_bytes=heatmap_bytes,
+            )
+            persisted_scan_id = saved.get("id")
+        except RuntimeError as exc:
+            if "Supabase client unavailable" in str(exc):
+                logger.warning("Scan persistence skipped: %s", exc)
+            else:
+                raise HTTPException(status_code=500, detail=f"Failed to persist scan: {exc}")
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Failed to persist scan: {exc}")
+
     _record_metric(app.state, "explain", (time.perf_counter() - start) * 1000)
-    return response
+    return ExplainPersistedResponse(**response.model_dump(), scan_id=persisted_scan_id)
+
+
+@app.get(
+    "/scans",
+    tags=["Scans"],
+    summary="List scans for a user",
+    description="Returns paginated scan history for a given user id.",
+)
+async def list_scans(
+    user_id: str = Query(...),
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+):
+    try:
+        rows = await get_user_scans(user_id=user_id, limit=limit, offset=offset)
+        return rows
+    except RuntimeError as exc:
+        if "Supabase client unavailable" in str(exc):
+            logger.warning("Returning empty scans list: %s", exc)
+            return []
+        raise HTTPException(status_code=500, detail=f"Failed to fetch scans: {exc}")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch scans: {exc}")
+
+
+@app.patch(
+    "/scans/{scan_id}/feedback",
+    tags=["Scans"],
+    summary="Update feedback for a scan",
+    description="Updates feedback and optional corrected class for a user-owned scan.",
+)
+async def patch_scan_feedback(
+    scan_id: str,
+    body: ScanFeedbackRequest,
+    x_user_id: str | None = Header(default=None, alias="X-User-Id"),
+):
+    if not x_user_id:
+        raise HTTPException(status_code=401, detail="X-User-Id header is required.")
+
+    try:
+        row = await update_scan_feedback(
+            scan_id=scan_id,
+            user_id=x_user_id,
+            feedback=body.feedback,
+            corrected_class=body.corrected_class,
+        )
+        return row
+    except RuntimeError as exc:
+        if "Supabase client unavailable" in str(exc):
+            raise HTTPException(status_code=503, detail="Supabase is not configured.")
+        raise HTTPException(status_code=500, detail=f"Failed to update feedback: {exc}")
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to update feedback: {exc}")
+
+
+@app.get(
+    "/alerts",
+    tags=["Alerts"],
+    summary="List disease alerts",
+    description="Returns disease alerts filtered by state/severity/activity.",
+)
+async def get_alerts(
+    state: str | None = Query(default=None),
+    severity: str | None = Query(default=None),
+    is_active: bool | None = Query(default=True),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+):
+    try:
+        return await list_alerts(
+            state=state,
+            severity=severity,
+            is_active=is_active,
+            limit=limit,
+            offset=offset,
+        )
+    except RuntimeError as exc:
+        if "Supabase client unavailable" in str(exc):
+            logger.warning("Returning empty alerts list: %s", exc)
+            return []
+        raise HTTPException(status_code=500, detail=f"Failed to fetch alerts: {exc}")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch alerts: {exc}")
+
+
+@app.post(
+    "/admin/alerts",
+    tags=["Admin"],
+    summary="Create a disease alert",
+)
+async def post_admin_alert(
+    body: AdminAlertCreateRequest,
+    admin_user: dict = Depends(require_admin_user),
+):
+    try:
+        row = await create_alert(body.model_dump())
+        row["created_by"] = admin_user.get("id")
+        return row
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to create alert: {exc}")
+
+
+@app.get(
+    "/admin/models",
+    tags=["Admin"],
+    summary="List registered models",
+)
+async def get_admin_models(admin_user: dict = Depends(require_admin_user)):
+    try:
+        models = list_registered_models()
+        return {
+            "models": models,
+            "active_model": app.state.active_model,
+            "requested_by": admin_user.get("email"),
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to list models: {exc}")
+
+
+@app.post(
+    "/admin/models/upload",
+    tags=["Admin"],
+    summary="Upload a trained model artifact",
+)
+async def post_admin_model_upload(
+    model_file: UploadFile = File(...),
+    class_names_file: UploadFile | None = File(default=None),
+    label: str | None = Form(default=None),
+    admin_user: dict = Depends(require_admin_user),
+):
+    filename = model_file.filename or "model.pth"
+    if not filename.lower().endswith(".pth"):
+        raise HTTPException(status_code=422, detail="model_file must be a .pth file")
+
+    model_bytes = await model_file.read()
+    if not model_bytes:
+        raise HTTPException(status_code=422, detail="Uploaded model file is empty.")
+
+    class_names_bytes = None
+    if class_names_file is not None:
+        class_names_bytes = await class_names_file.read()
+
+    try:
+        entry = register_model(
+            model_bytes=model_bytes,
+            original_filename=filename,
+            label=label,
+            class_names_bytes=class_names_bytes,
+        )
+        entry["uploaded_by"] = admin_user.get("email")
+        return entry
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to upload model: {exc}")
+
+
+@app.post(
+    "/admin/models/activate",
+    tags=["Admin"],
+    summary="Activate a registered model",
+)
+async def post_admin_activate_model(
+    body: AdminModelActivateRequest,
+    admin_user: dict = Depends(require_admin_user),
+):
+    try:
+        selected = activate_model(body.model_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to select model: {exc}")
+
+    model_path = Path(selected["model_path"])
+    class_names_path = (
+        Path(selected["class_names_path"])
+        if selected.get("class_names_path")
+        else None
+    )
+
+    if not model_path.is_file():
+        raise HTTPException(status_code=500, detail="Selected model file is missing on disk.")
+
+    try:
+        _load_runtime_model(app.state, model_path, class_names_path, selected)
+        return {
+            "status": "activated",
+            "model": app.state.active_model,
+            "activated_by": admin_user.get("email"),
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to activate model: {exc}")
+
+
+@app.post(
+    "/internal/detect-outbreaks",
+    tags=["Admin"],
+    summary="Detect outbreaks from scan trends",
+)
+async def run_outbreak_detection(
+    x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
+):
+    configured_token = os.getenv("INTERNAL_API_TOKEN")
+    if configured_token and x_internal_token != configured_token:
+        raise HTTPException(status_code=403, detail="Invalid internal token.")
+
+    try:
+        return await auto_detect_outbreaks()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Outbreak detection failed: {exc}")
 
 
 @app.post(

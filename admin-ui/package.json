@@ -1,0 +1,21 @@
+{
+  "name": "aglen-admin-ui",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --port 5174",
+    "build": "vite build",
+    "preview": "vite preview --port 4174"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.57.2",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4",
+    "recharts": "^3.3.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^6.0.1",
+    "vite": "^8.0.8"
+  }
+}

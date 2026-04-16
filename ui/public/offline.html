@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AgroLens Offline</title>
+  <style>
+    :root {
+      --brand: #1a3c2b;
+      --bg: #f4f7f2;
+      --ink: #13251b;
+      --muted: #5e7164;
+      --card: #ffffff;
+      --line: #dce4da;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      font-family: "Manrope", "Segoe UI", system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--ink);
+      min-height: 100vh;
+    }
+
+    header {
+      background: var(--brand);
+      color: #ffffff;
+      padding: 18px 20px;
+      box-shadow: 0 2px 12px rgba(16, 34, 24, 0.25);
+    }
+
+    header p {
+      margin: 0;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      font-size: 12px;
+      opacity: 0.85;
+    }
+
+    header h1 {
+      margin: 4px 0 0;
+      font-size: 24px;
+    }
+
+    main {
+      max-width: 680px;
+      margin: 0 auto;
+      padding: 24px 16px;
+    }
+
+    .card {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 18px;
+      line-height: 1.5;
+    }
+
+    .card h2 {
+      margin: 0 0 8px;
+      font-size: 22px;
+    }
+
+    .card p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 16px;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <p>AgroLens</p>
+    <h1>Offline mode</h1>
+  </header>
+  <main>
+    <section class="card">
+      <h2>You're offline</h2>
+      <p>Your recent scans are still available in your history. Connect to analyze new leaves.</p>
+    </section>
+  </main>
+</body>
+</html>

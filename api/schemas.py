@@ -63,6 +63,35 @@ class ExplainResponse(PredictionResponse):
     )
 
 
+class ExplainPersistedResponse(ExplainResponse):
+    """Returned by ``POST /explain`` when persistence is enabled."""
+
+    scan_id: str | None = Field(
+        default=None,
+        description="Persisted scan identifier when X-User-Id is provided.",
+    )
+
+
+class ScanFeedbackRequest(BaseModel):
+    """Request body for updating scan feedback."""
+
+    feedback: str = Field(..., pattern="^(confirmed|wrong|unsure)$")
+    corrected_class: str | None = None
+
+
+class AdminAlertCreateRequest(BaseModel):
+    disease_class: str
+    severity: str = Field(default="low", pattern="^(low|medium|high|critical)$")
+    affected_state: str
+    affected_district: str | None = None
+    case_count: int = Field(default=0, ge=0)
+    advisory_text: str | None = None
+
+
+class AdminModelActivateRequest(BaseModel):
+    model_id: str
+
+
 class HealthResponse(BaseModel):
     """Returned by ``GET /health``."""
 
