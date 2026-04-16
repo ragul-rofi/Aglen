@@ -1,0 +1,16 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: aglen-api
+    ports:
+      - "8000:8000"
+    environment:
+      MODEL_PATH: src/weights/best_model.pth
+      DEVICE: cpu
+      UVICORN_HOST: 0.0.0.0
+      UVICORN_PORT: 8000
+      UVICORN_WORKERS: 2
+      UVICORN_LOG_LEVEL: info
+    restart: unless-stopped

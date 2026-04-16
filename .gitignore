@@ -1,0 +1,26 @@
+# Environment
+.env
+venv/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Model weights
+src/weights/*.pth
+
+# Dataset
+data/plantvillage/
+data/_kaggle_tmp/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# W&B
+wandb/
