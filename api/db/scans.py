@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 
-from api.db.client import db
+from api.db.client import get_db
 
 
 async def _run_io(fn, *args, **kwargs):
@@ -21,6 +21,7 @@ async def save_scan(
     image_bytes: bytes,
     heatmap_bytes: bytes,
 ) -> dict:
+    db = get_db()
     scan_id = str(uuid.uuid4())
     image_path = f"{user_id}/{scan_id}.jpg"
     heatmap_path = f"{user_id}/{scan_id}_heatmap.jpg"
@@ -62,6 +63,7 @@ async def save_scan(
 
 
 async def get_user_scans(user_id: str, limit: int = 20, offset: int = 0) -> list[dict]:
+    db = get_db()
     end = offset + max(limit, 1) - 1
     response = await _run_io(
         db.table("scans")
@@ -80,6 +82,7 @@ async def update_scan_feedback(
     feedback: str,
     corrected_class: str | None,
 ) -> dict:
+    db = get_db()
     payload: dict = {"feedback": feedback, "corrected_class": corrected_class}
 
     response = await _run_io(
