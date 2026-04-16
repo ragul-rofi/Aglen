@@ -12,11 +12,10 @@ GET  /classes   List all supported disease class names.
 from __future__ import annotations
 
 import asyncio
-import io
+import base64
 import json
 import logging
 import os
-import tempfile
 import time
 import traceback
 import uuid
@@ -28,20 +27,23 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Header, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from api.db.scans import get_user_scans, save_scan, update_scan_feedback
 from api.schemas import (
     ClassConfidence,
     EndpointMetrics,
     ErrorResponse,
+    ExplainPersistedResponse,
     ExplainResponse,
     HealthResponse,
     MetricsResponse,
     PredictionRequest,
     PredictionResponse,
     RootResponse,
+    ScanFeedbackRequest,
 )
 from api.utils import (
     ALLOWED_MIME_TYPES,
@@ -82,6 +84,10 @@ TAGS = [
     {
         "name": "Meta",
         "description": "Health checks and model metadata.",
+    },
+    {
+        "name": "Scans",
+        "description": "Persisted scan history and feedback.",
     },
 ]
 
@@ -394,6 +400,7 @@ async def root():
             "/predict/base64",
             "/explain",
             "/explain/base64",
+            "/scans",
         ],
     )
 
@@ -518,7 +525,7 @@ async def predict_base64(body: PredictionRequest):
 
 @app.post(
     "/explain",
-    response_model=ExplainResponse,
+    response_model=ExplainPersistedResponse,
     responses={
         422: {"model": ErrorResponse, "description": "Invalid image format."},
         503: {"model": ErrorResponse, "description": "Model not loaded."},
@@ -531,12 +538,22 @@ async def predict_base64(body: PredictionRequest):
 )
 async def explain(
     file: UploadFile = File(...),
+    x_user_id: str | None = Header(default=None, alias="X-User-Id"),
 ):
     _require_model(app.state)
 
     start = time.perf_counter()
     try:
-        image_rgb = await _read_upload(file)
+        if not file.filename:
+            raise ValueError("No file was uploaded. Choose an image and try again.")
+
+        validate_content_type(file.content_type)
+        image_bytes = await file.read()
+        if not image_bytes:
+            raise ValueError("Uploaded file is empty. Please upload a valid image file.")
+
+        validate_file_size(image_bytes)
+        image_rgb = bytes_to_rgb_array(image_bytes)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=f"{exc} {_upload_validation_hint()}")
 
@@ -552,8 +569,69 @@ async def explain(
             app.state.device,
         ),
     )
+
+    persisted_scan_id: str | None = None
+    if x_user_id:
+        try:
+            heatmap_bytes = base64.b64decode(response.heatmap_base64)
+            saved = await save_scan(
+                user_id=x_user_id,
+                scan_data=response.model_dump(),
+                image_bytes=image_bytes,
+                heatmap_bytes=heatmap_bytes,
+            )
+            persisted_scan_id = saved.get("id")
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Failed to persist scan: {exc}")
+
     _record_metric(app.state, "explain", (time.perf_counter() - start) * 1000)
-    return response
+    return ExplainPersistedResponse(**response.model_dump(), scan_id=persisted_scan_id)
+
+
+@app.get(
+    "/scans",
+    tags=["Scans"],
+    summary="List scans for a user",
+    description="Returns paginated scan history for a given user id.",
+)
+async def list_scans(
+    user_id: str = Query(...),
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+):
+    try:
+        rows = await get_user_scans(user_id=user_id, limit=limit, offset=offset)
+        return rows
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch scans: {exc}")
+
+
+@app.patch(
+    "/scans/{scan_id}/feedback",
+    tags=["Scans"],
+    summary="Update feedback for a scan",
+    description="Updates feedback and optional corrected class for a user-owned scan.",
+)
+async def patch_scan_feedback(
+    scan_id: str,
+    body: ScanFeedbackRequest,
+    x_user_id: str | None = Header(default=None, alias="X-User-Id"),
+):
+    if not x_user_id:
+        raise HTTPException(status_code=401, detail="X-User-Id header is required.")
+
+    try:
+        row = await update_scan_feedback(
+            scan_id=scan_id,
+            user_id=x_user_id,
+            feedback=body.feedback,
+            corrected_class=body.corrected_class,
+        )
+        return row
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to update feedback: {exc}")
 
 
 @app.post(

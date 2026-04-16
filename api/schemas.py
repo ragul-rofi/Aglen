@@ -63,6 +63,22 @@ class ExplainResponse(PredictionResponse):
     )
 
 
+class ExplainPersistedResponse(ExplainResponse):
+    """Returned by ``POST /explain`` when persistence is enabled."""
+
+    scan_id: str | None = Field(
+        default=None,
+        description="Persisted scan identifier when X-User-Id is provided.",
+    )
+
+
+class ScanFeedbackRequest(BaseModel):
+    """Request body for updating scan feedback."""
+
+    feedback: str = Field(..., pattern="^(confirmed|wrong|unsure)$")
+    corrected_class: str | None = None
+
+
 class HealthResponse(BaseModel):
     """Returned by ``GET /health``."""
 
